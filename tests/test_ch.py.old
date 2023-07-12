@@ -1,0 +1,484 @@
+from __future__ import annotations
+
+import asyncio
+import json
+import subprocess as sp
+import time
+import urllib.parse
+from dataclasses import dataclass, InitVar
+from time import sleep
+
+import aiohttp
+import pytest as pytest
+import requests
+from typing import Any
+
+
+# SOURCE_HOST = "localhost"
+# TARGET_HOST = "marmot.local"
+
+
+# @dataclass(frozen=True)
+# class HttpClient:
+#     hostname: str
+#     port: int
+#
+#     @classmethod
+#     def source(cls):
+#         return cls(SOURCE_HOST)
+#
+#     def _url(self, query: str):
+#         return f"http://{self.hostname}:{self.port}?query={urllib.parse.quote(query)}"
+#
+#     def get(self, query: str) -> Response:
+#         response = requests.get(self._url(query))
+#         if response.status_code != 200:
+#             raise Exception(f"Get failed: {response.status_code} {response.text}")
+#         return response
+#
+#     def check(self) -> bool:
+#         try:
+#             if self.get_json("SELECT 42 AS dummy") == [{"dummy": 42}]:
+#                 return True
+#         except Exception:
+#             pass
+#         return False
+#
+#     def post(self, query: str, *args, **kwargs) -> None:
+#         response = requests.post(self._url(query), *args, **kwargs)
+#         if response.status_code != 200:
+#             raise Exception(f"Post failed: {response.status_code} {response.text}")
+#
+#     def get_json(self, query: str) -> Any:
+#         return self.get(f"{query} FORMAT JSON").json()["data"]
+#
+#     def get_content(self, query: str) -> bytes:
+#         return self.get(f"{query}").content
+#
+#     def database(self, database: str) -> Database:
+#         return Database(self, database)
+#
+#     def wait_to_start(self) -> None:
+#         for _ in range(10):
+#             print(f"Waiting for ClickHouse on {self.hostname}:{self.port} to start")
+#             sleep(1)
+#             if self.check():
+#                 print(f"ClickHouse started on {self.hostname}:{self.port}")
+#                 return
+#         raise Exception(f"ClickHouse has not started on {self.hostname}:{self.port}")
+
+#
+# @dataclass(frozen=True)
+# class Database:
+#     client: HttpClient
+#     database: str
+#
+#     def table(self, table) -> Table:
+#         return Table(self.client, self.database, table)
+#
+#     def all_tables(self):
+#         for row in self.client.get_json(f"SELECT table from system.tables WHERE database = '{self.database}'"):
+#             yield self.table(row["table"])
+#
+#     def recreate(self) -> None:
+#         self.client.post(f"DROP DATABASE IF EXISTS {self.database}")
+#         self.client.post(f"CREATE DATABASE {self.database} ")
+#
+#     def populate_table(self, table: str, num_dates: int, rows_per_date: int, num_dims: int) -> None:
+#         dims = ["col_%d" % i for i in range(num_dims)]
+#
+#         post = self.client.post
+#         random = f"`{self.database}`.`_random`"
+#         table = f"`{self.database}`.`{table}`"
+#
+#         post(f"DROP TABLE IF EXISTS {random}")
+#         post(f"DROP TABLE IF EXISTS {table}")
+#
+#         post(f"CREATE TABLE {random} " \
+#              f"({', '.join(f'{di} String' for di in dims)}, value DOUBLE) " \
+#              f"ENGINE=GenerateRandom(123123, 10)")
+#
+#         post(f"CREATE TABLE {table} "
+#              f"(date String, {', '.join(f'{di} String' for di in dims)}, value DOUBLE) "
+#              f"ENGINE MergeTree PRIMARY KEY ({', '.join(dims)}) PARTITION by date")
+#
+#         for i in range(num_dates):
+#             print(f"Inserting {rows_per_date} rows ({i + 1}/{num_dates})")
+#             date = dt.date(2022, 1, 1) + dt.timedelta(days=i)
+#             post(f"INSERT INTO {table} SELECT '{date}', r.* FROM {random} AS r LIMIT {rows_per_date}")
+#
+#         post(f"DROP TABLE {random}")
+
+
+# @dataclass(frozen=True)
+# class Table:
+#     client: HttpClient
+#     database: str
+#     table: str
+#
+#     def get_partition_ids(self) -> List[str]:
+#         query = f"SELECT DISTINCT partition_id FROM system.parts " \
+#                 f"WHERE database = '{self.database}' " \
+#                 f"AND table = '{self.table}' ORDER BY partition"
+#         partition_ids = self.client.get_json(query)
+#         return [row["partition_id"] for row in partition_ids]
+#
+#     def get_total_bytes(self) -> int:
+#         query = f"SELECT total_bytes FROM system.tables " \
+#                 f"WHERE database = '{self.database}' " \
+#                 f"AND table = '{self.table}'"
+#         return int(self.client.get_json(query)[0]["total_bytes"])
+#
+#     def get_native(self, predicate: str) -> bytes:
+#         query = f"SELECT * FROM `{self.database}`.`{self.table}` WHERE {predicate} FORMAT  Native"
+#         return self.client.get_content(query)
+#
+#     def read_partition(self, partition_id: str):
+#         query = f"SELECT * FROM `{self.database}`.`{self.table}` WHERE _partition_id = '{partition_id}' FORMAT Native"
+#         return self.client.get_content(query)
+#
+#     def get_ddl(self) -> str:
+#         return self.client.get_json(f"SHOW TABLE `{self.database}`.`{self.table}`")[0]["statement"]
+#
+#     def write_partition(self, data: bytes) -> None:
+#         self.client.post(f"INSERT INTO `{self.database}`.`{self.table}` FORMAT  Native", data)
+#
+
+
+def wait_for_ch(hostname: str, port: int) -> None:
+    for _ in range(10):
+        print(f"Waiting for ClickHouse on {hostname}:{port} to start")
+        sleep(1)
+        if check_ch(hostname, port):
+            print(f"ClickHouse started on {hostname}:{port}")
+            return
+    raise Exception(f"ClickHouse has not started on {hostname}:{port}")
+
+
+def check_ch(hostname: str, port: int):
+    try:
+        url = f"http://{hostname}:{port}?query={urllib.parse.quote('SELECT 42 AS dummy FORMAT JSON')}"
+        print(url)
+        return requests.get(url).json()["data"] == [{"dummy": 42}]
+    except Exception:
+        return False
+
+
+def client_fixture(hostname: str, port: int) -> ClientFactory:
+    if not check_ch(hostname, port):
+        command = f"podman run -d -p {port}:8123 docker.io/clickhouse/clickhouse-server".split(" ")
+        if sp.run(command).returncode != 0:
+            raise Exception(f"Command failed: {command}")
+        wait_for_ch(hostname, port)
+
+    return ClientFactory(hostname, port)
+
+
+@pytest.fixture
+def source() -> ClientFactory:
+    return client_fixture("localhost", 8128)
+
+
+@pytest.fixture
+def target() -> ClientFactory:
+    return client_fixture("localhost", 8129)
+
+
+@dataclass(frozen=True)
+class ClientFactory:
+    hostname: str
+    port: int
+
+    def create(self, session):
+        return AsyncClient(hostname=self.hostname, port=self.port, session=session)
+
+
+#
+# def test_http_client_get_json(source: Database) -> None:
+#     assert source.client.get_json("SELECT 42 AS dummy") == [{"dummy": 42}]
+#
+#
+# def test_get_partition_ids(source: Database) -> None:
+#     partition_ids = source.table("t1").get_partition_ids()
+#     assert isinstance(partition_ids, list)
+#     assert all(isinstance(x, str) for x in partition_ids)
+#
+#
+# def test_get_total_bytes(source: Database) -> None:
+#     total_bytes = source.table("t1").get_total_bytes()
+#     assert isinstance(total_bytes, int)
+#     assert total_bytes > 0
+
+#
+# @dataclass
+# class Progress:
+#     _pending: int
+#     _buffered: int = 0
+#     _written: int = 0
+#     _exception: Optional[Exception] = None
+#     _condition: Condition = field(default_factory=Condition)
+#
+#     def update(self, pending=0, buffered=0, written=0):
+#         with self._condition:
+#             self._pending += pending
+#             self._buffered += buffered
+#             self._written += written
+#             self._condition.notify()
+#
+#     def __iter__(self):
+#         for ci in count():
+#             with self._condition:
+#                 if ci > 0:
+#                     self._condition.wait()
+#                 if self._exception is not None:
+#                     raise Exception() from self._exception
+#                 yield f"{self._pending}/{self._buffered}/{self._written}"
+#                 if self._pending == 0 and self._buffered == 0:
+#                     return
+#
+#     def stop_on_exception(self, f):
+#         def wrapper(*args):
+#             try:
+#                 return f(*args)
+#             except Exception as exception:
+#                 with self._condition:
+#                     self._exception = exception
+#                     self._condition.notify()
+#
+#         return wrapper
+#
+#
+# def test_read_bandwidth(source: Database):
+#     source.client.post("SYSTEM DROP QUERY CACHE")
+#     source.client.post("SYSTEM DROP FILESYSTEM CACHE")
+#     table = source.table("t1")
+#     start_time = time.time()
+#     total_bytes = table.get_total_bytes()
+#     partition_ids = table.get_partition_ids()
+#     for i, partition_id in enumerate(partition_ids):
+#         table.get_native(f"_partition_id = '{partition_id}'")
+#         print(f"Read {i + 1}/{len(partition_ids)}")
+#     total_time = time.time() - start_time
+#     print(
+#         f"Read {total_bytes / 1024 / 1024:.0f}MB in {total_time:.3f}s: {total_bytes / 1024 / 1024 / total_time:.1f}MB/s")
+#
+#
+# def test_copy2(source: Database, target: Database):
+#     print("\n\n")
+#
+#     num_readers = 2
+#     num_writers = 8
+#     buffer = 12
+#
+#     buffer_semaphore = Semaphore(buffer)
+#
+#     start_time = time.time()
+#
+#     tables = list(source.all_tables())
+#     tasks = [(ti, pid) for ti in tables for pid in ti.get_partition_ids()]
+#     total_bytes = sum(ti.get_total_bytes() for ti in tables)
+#
+#     target.recreate()
+#     for ti in tables:
+#         target.client.post(ti.get_ddl())
+#
+#     progress = Progress(len(tasks))
+#
+#     @progress.stop_on_exception
+#     def write(table, data):
+#         target.table(table.table).write_partition(data)
+#         buffer_semaphore.release()
+#         progress.update(buffered=-1, written=1)
+#
+#     @progress.stop_on_exception
+#     def read(table: Table, partition_id: str) -> None:
+#         buffer_semaphore.acquire()
+#         write_pool.submit(write, table, table.read_partition(partition_id))
+#         progress.update(pending=-1, buffered=1)
+#
+#     read_pool = ThreadPoolExecutor(num_readers)
+#     write_pool = ThreadPoolExecutor(num_writers)
+#     try:
+#         for ti, pi in tasks:
+#             read_pool.submit(read, ti, pi)
+#         for pi in progress:
+#             print(pi)
+#     finally:
+#         read_pool.shutdown(wait=True, cancel_futures=True)
+#         write_pool.shutdown(wait=True, cancel_futures=True)
+#
+#     total_time = time.time() - start_time
+#     print(
+#         f"Copied {total_bytes / 1024 / 1024:.0f}MB in {total_time:.3f}s: {total_bytes / 1024 / 1024 / total_time:.1f}MB/s")
+#
+import datetime as dt
+
+async def populate_table(client: AsyncClient, num_dates: int = 40, rows_per_date: int = 1000, num_dims: int = 100):
+    await client.post(f"DROP DATABASE IF EXISTS example")
+    await client.post(f"CREATE DATABASE example")
+
+    #     def populate_table(self, table: str, num_dates: int, rows_per_date: int, num_dims: int) -> None:
+    dims = ["col_%d" % i for i in range(num_dims)]
+
+    # post = self.client.post
+    # random = f"`{self.database}`.`_random`"
+    # table = f"`{self.database}`.`{table}`"
+
+    await client.post(f"DROP TABLE IF EXISTS example._random")
+    await client.post(f"DROP TABLE IF EXISTS example.t1")
+
+    await client.post(
+        f"CREATE TABLE example._random " \
+        f"({', '.join(f'{di} String' for di in dims)}, value DOUBLE) " \
+        f"ENGINE=GenerateRandom(123123, 10)")
+
+    await client.post(
+        f"CREATE TABLE example.t1 "
+        f"(date String, {', '.join(f'{di} String' for di in dims)}, value DOUBLE) "
+        f"ENGINE MergeTree PRIMARY KEY ({', '.join(dims)}) PARTITION by date")
+
+    for i in range(num_dates):
+        print(f"Inserting {rows_per_date} rows ({i + 1}/{num_dates})")
+        date = dt.date(2022, 1, 1) + dt.timedelta(days=i)
+        await client.post(
+            f"INSERT INTO example.t1 SELECT '{date}', r.* FROM example._random AS r LIMIT {rows_per_date}")
+
+    await client.post(f"DROP TABLE example._random")
+
+
+def test_populate(source: ClientFactory) -> None:
+    async def populate():
+        async with aiohttp.ClientSession() as session:
+            await populate_table(source.create(session), num_dates=40, rows_per_date=1000, num_dims=100)
+
+    asyncio.run(populate())
+
+
+#  print("\n")
+#  source.recreate()
+#  source.populate_table("t1", num_dates=40, rows_per_date=1000, num_dims=100)
+
+
+@dataclass
+class Copier:
+    source_client: AsyncClient
+    target_client: AsyncClient
+    database: str
+    num_readers: InitVar[int]
+    num_writers: InitVar[int]
+    buffer: InitVar[int]
+
+    def __post_init__(self, num_readers, num_writers, buffer):
+        self.read_semaphore = asyncio.Semaphore(num_readers)
+        self.write_semaphore = asyncio.Semaphore(num_writers)
+        self.buffer_semaphore = asyncio.Semaphore(buffer)
+        self.num_pending = 0
+        self.num_queued = 0
+        self.num_written = 0
+
+    def update(self, num_pending=0, num_queued=0, num_written=0):
+        self.num_pending += num_pending
+        self.num_queued += num_queued
+        self.num_written += num_written
+        print(f"{self.num_pending}/{self.num_queued}/{self.num_written}")
+
+    async def read_partition(self, table: str, partition_id: str):
+        async with self.read_semaphore:
+            await self.buffer_semaphore.acquire()
+            query = f"SELECT * FROM `{self.database}`.`{table}` WHERE _partition_id = '{partition_id}' FORMAT Native"
+            return await self.source_client.get(query)
+
+    async def get_tables(self):
+        query = f"SELECT table from system.tables WHERE database = '{self.database}'"
+        result = await self.source_client.get_json(query)
+        return [row["table"] for row in result]
+
+    async def get_partition_ids(self, table):
+        query = f"SELECT DISTINCT partition_id FROM system.parts " \
+                f"WHERE database = '{self.database}' " \
+                f"AND table = '{table}' ORDER BY partition"
+        result = await self.source_client.get_json(query)
+        return [row["partition_id"] for row in result]
+
+    async def get_total_bytes(self) -> int:
+        query = f"SELECT SUM(total_bytes) AS total_bytes FROM system.tables " \
+                f"WHERE database = '{self.database}'"
+        result = await self.source_client.get_json(query)
+        return int(result[0]["total_bytes"])
+
+    async def get_ddl(self, table) -> str:
+        result = await self.source_client.get_json(f"SHOW TABLE `{self.database}`.`{table}`")
+        return result[0]["statement"]
+
+    async def write_partition(self, table: str, data: bytes):
+        async with self.write_semaphore:
+            self.buffer_semaphore.release()
+            await self.target_client.post(f"INSERT INTO `{self.database}`.`{table}` FORMAT Native", data)
+
+    async def copy_partition(self, table: str, partition_id: str):
+        data = await self.read_partition(table, partition_id)
+        self.update(num_pending=-1, num_queued=+1)
+        await self.write_partition(table, data)
+        self.update(num_queued=-1, num_written=+1)
+
+    async def copy(self):
+        start_time = time.time()
+
+        tables = await self.get_tables()
+        partitions = [(ti, pid) for ti in tables for pid in await self.get_partition_ids(ti)]
+
+        total_bytes = await self.get_total_bytes()
+
+        self.update(num_pending=len(partitions))
+
+        await self.target_client.post(f"DROP DATABASE IF EXISTS {self.database}")
+        await self.target_client.post(f"CREATE DATABASE {self.database}")
+        for ti in tables:
+            await self.target_client.post(await self.get_ddl(ti))
+
+        tasks = [asyncio.create_task(self.copy_partition(ti, pi)) for ti, pi in partitions]
+        await asyncio.gather(*tasks)
+
+        total_time = time.time() - start_time
+        print(
+            f"Copied {total_bytes / 1024 / 1024:.0f}MB in {total_time:.3f}s: {total_bytes / 1024 / 1024 / total_time:.1f}MB/s")
+
+
+@dataclass(frozen=True)
+class AsyncClient:
+    session: Any
+    hostname: str
+    port: int
+
+    def url(self, query):
+        return f"http://{self.hostname}:{self.port}?query={urllib.parse.quote(query)}"
+
+    async def get(self, query):
+        async with self.session.get(self.url(query)) as response:
+            if response.status != 200:
+                raise Exception(f"Error {response.status} {response.text}")
+            return await response.content.read()
+
+    async def post(self, query, data=None):
+        async with self.session.post(self.url(query), data=data) as response:
+            if response.status != 200:
+                raise Exception(f"Error {response.status} {response.text}")
+
+    async def get_json(self, query):
+        result = await self.get(f"{query} FORMAT JSON")
+        return json.loads(result)["data"]
+
+
+def test_async_copy(source: ClientFactory, target: ClientFactory):
+    print("\n")
+
+    async def copy():
+        async with aiohttp.ClientSession() as session:
+            source_client = source.create(session)
+            target_client = target.create(session)
+
+            copier = Copier(source_client=source_client, target_client=target_client, database="example", num_readers=4,
+                            num_writers=8, buffer=12)
+            await copier.copy()
+
+    asyncio.run(copy())
